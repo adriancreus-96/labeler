@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: yolo-labeller
+    runtime: python
+    buildCommand: |
+      apt-get update && apt-get install -y tesseract-ocr libgl1
+      pip install -r requirements.txt
+    startCommand: gunicorn app:app --timeout 120 --workers 1
+    envVars:
+      - key: TESSERACT_PATH
+        value: /usr/bin/tesseract
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY
+        sync: false
+      - key: R2_SECRET_KEY
+        sync: false
+      - key: R2_BUCKET
+        value: labeler

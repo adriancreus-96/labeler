@@ -1,65 +1,122 @@
 """
-app.py  -  YOLO Degradation Labeller Web App (with built-in degradation + OCR)
-
-Usage:
-    pip install flask opencv-python pytesseract numpy
-    python app.py
-    Open http://localhost:5000
-
-Drop your ORIGINAL images (.jpg or .png) into the queue/ folder.
-The app will run OCR + degradation automatically before showing each image.
+app.py  -  YOLO Degradation Labeller (Cloudflare R2 + Render deployment)
 """
 
 import cv2
 import json
 import math
 import random
-import shutil
+import io
+import os
 from pathlib import Path
 
 import numpy as np
 import pytesseract
-from flask import Flask, render_template, jsonify, request, send_from_directory, abort
+import boto3
+from botocore.config import Config
+from flask import Flask, render_template, jsonify, request, send_file, abort
 
 app = Flask(__name__)
 
-# ─────────────────────────────────────────────────────────────────
-# CONFIG  –  edit these two lines if needed
-# ─────────────────────────────────────────────────────────────────
-TESSERACT_PATH = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-TOTAL_IMAGES   = 2000          # used for the progress bar and split targets
-OCR_CONF       = 60            # minimum Tesseract confidence to keep a word box
-# ─────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════
+# CONFIG
+# ══════════════════════════════════════════════════════════════════
+
+TESSERACT_PATH = os.environ.get("TESSERACT_PATH", "/usr/bin/tesseract")
+OCR_CONF       = 60
+TOTAL_IMAGES   = 2000
+SPLITS         = ["train", "val", "test"]
+SPLIT_RATIOS   = [0.70, 0.15, 0.15]
+IMG_EXTS       = (".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG")
 
 pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
-BASE_DIR     = Path(__file__).parent
-QUEUE_DIR    = BASE_DIR / "queue"    # put raw originals here
-CACHE_DIR    = BASE_DIR / "cache"    # auto-managed: degraded images + box data
-DATASET_DIR  = BASE_DIR / "dataset"
-STATE_FILE   = BASE_DIR / "state.json"
+R2_ACCOUNT_ID = os.environ["R2_ACCOUNT_ID"]
+R2_ACCESS_KEY = os.environ["R2_ACCESS_KEY"]
+R2_SECRET_KEY = os.environ["R2_SECRET_KEY"]
+R2_BUCKET     = os.environ.get("R2_BUCKET", "labeler")
 
-SPLITS       = ["train", "val", "test"]
-SPLIT_RATIOS = [0.70, 0.15, 0.15]
-IMG_EXTS     = (".png", ".jpg", ".jpeg", ".PNG", ".JPG", ".JPEG")
+s3 = boto3.client(
+    "s3",
+    endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+    aws_access_key_id=R2_ACCESS_KEY,
+    aws_secret_access_key=R2_SECRET_KEY,
+    config=Config(signature_version="s3v4"),
+    region_name="auto",
+)
+
+STATE_KEY = "state.json"
+
+
+# ══════════════════════════════════════════════════════════════════
+# R2 HELPERS
+# ══════════════════════════════════════════════════════════════════
+
+def r2_read_bytes(key):
+    try:
+        obj = s3.get_object(Bucket=R2_BUCKET, Key=key)
+        return obj["Body"].read()
+    except Exception:
+        return None
+
+def r2_write_bytes(key, data, content_type="application/octet-stream"):
+    s3.put_object(Bucket=R2_BUCKET, Key=key, Body=data, ContentType=content_type)
+
+def r2_write_text(key, text):
+    r2_write_bytes(key, text.encode(), "text/plain")
+
+def r2_read_text(key):
+    b = r2_read_bytes(key)
+    return b.decode() if b is not None else None
+
+def r2_delete(key):
+    try:
+        s3.delete_object(Bucket=R2_BUCKET, Key=key)
+    except Exception:
+        pass
+
+def r2_list_prefix(prefix):
+    keys = []
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            keys.append(obj["Key"])
+    return keys
+
+def r2_exists(key):
+    try:
+        s3.head_object(Bucket=R2_BUCKET, Key=key)
+        return True
+    except Exception:
+        return False
+
+def np_to_png_bytes(img):
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        raise ValueError("cv2.imencode failed")
+    return buf.tobytes()
+
+def bytes_to_np(data):
+    arr = np.frombuffer(data, dtype=np.uint8)
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
 # ══════════════════════════════════════════════════════════════════
 # STATE
 # ══════════════════════════════════════════════════════════════════
 
-def load_state() -> dict:
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
+def load_state():
+    text = r2_read_text(STATE_KEY)
+    if text:
+        return json.loads(text)
     return {"done": 0, "split_counts": {"train": 0, "val": 0, "test": 0}}
 
-def save_state(s: dict):
-    STATE_FILE.write_text(json.dumps(s, indent=2))
+def save_state(s):
+    r2_write_text(STATE_KEY, json.dumps(s, indent=2))
 
-def next_split(counts: dict) -> str:
-    """Deterministically pick whichever split is furthest below its target."""
+def next_split(counts):
     targets = {s: math.floor(TOTAL_IMAGES * r) for s, r in zip(SPLITS, SPLIT_RATIOS)}
-    targets["train"] += TOTAL_IMAGES - sum(targets.values())  # remainder → train
+    targets["train"] += TOTAL_IMAGES - sum(targets.values())
     gaps = {s: targets[s] - counts[s] for s in SPLITS}
     return max(gaps, key=gaps.get)
 
@@ -68,17 +125,18 @@ def next_split(counts: dict) -> str:
 # QUEUE
 # ══════════════════════════════════════════════════════════════════
 
-def queue_items() -> list:
-    """Return all pending originals in queue/, sorted by name."""
-    QUEUE_DIR.mkdir(exist_ok=True)
+def queue_items():
+    keys = r2_list_prefix("queue/")
     seen, items = set(), []
-    for ext in IMG_EXTS:
-        for p in sorted(QUEUE_DIR.glob(f"*{ext}")):
-            stem = p.stem
-            if stem.endswith("_done") or stem in seen:
-                continue
-            seen.add(stem)
-            items.append({"stem": stem, "path": p})
+    for key in sorted(keys):
+        fname = key.split("/")[-1]
+        stem, ext = os.path.splitext(fname)
+        if ext.lower() not in [e.lower() for e in IMG_EXTS]:
+            continue
+        if stem.endswith("_done") or stem in seen:
+            continue
+        seen.add(stem)
+        items.append({"stem": stem, "key": key})
     items.sort(key=lambda x: x["stem"])
     return items
 
@@ -96,8 +154,8 @@ def salt_pepper(img):
     prob = random.uniform(0.01, 0.05)
     out  = img.copy()
     rnd  = np.random.rand(*img.shape[:2])
-    out[rnd < prob / 2]       = 0
-    out[rnd > 1 - prob / 2]   = 255
+    out[rnd < prob / 2]     = 0
+    out[rnd > 1 - prob / 2] = 255
     return out
 
 def gaussian_blur(img):
@@ -105,8 +163,8 @@ def gaussian_blur(img):
     return cv2.GaussianBlur(img, (k, k), 0)
 
 def motion_blur(img):
-    k     = random.randint(3, 15)
-    angle = random.uniform(0, 180)
+    k      = random.randint(3, 15)
+    angle  = random.uniform(0, 180)
     kernel = np.zeros((k, k), dtype=np.float32)
     kernel[k // 2, :] = 1.0 / k
     M      = cv2.getRotationMatrix2D((k / 2, k / 2), angle, 1)
@@ -173,7 +231,7 @@ def draw_strokes(img):
     a = random.uniform(0.1, 0.35)
     return cv2.addWeighted(img, 1 - a, overlay, a, 0)
 
-def degrade(img: np.ndarray) -> np.ndarray:
+def degrade(img):
     img = gaussian_noise(img)
     img = salt_pepper(img)
     img = gaussian_blur(img)
@@ -189,8 +247,7 @@ def degrade(img: np.ndarray) -> np.ndarray:
 # OCR
 # ══════════════════════════════════════════════════════════════════
 
-def extract_boxes(img: np.ndarray, img_w: int, img_h: int) -> list:
-    """Run Tesseract on a clean image and return normalised YOLO-style boxes."""
+def extract_boxes(img, img_w, img_h):
     data  = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
     boxes = []
     for i in range(len(data["text"])):
@@ -212,48 +269,42 @@ def extract_boxes(img: np.ndarray, img_w: int, img_h: int) -> list:
 
 
 # ══════════════════════════════════════════════════════════════════
-# CACHE  –  process each image once, store result
+# CACHE
 # ══════════════════════════════════════════════════════════════════
 
-def get_cached(stem: str, src_path: Path) -> dict:
-    """
-    OCR + degrade src_path if not already cached.
-    Returns {"boxes": [...], "img_path": Path}.
-    """
-    CACHE_DIR.mkdir(exist_ok=True)
-    cache_img  = CACHE_DIR / f"{stem}.png"
-    cache_meta = CACHE_DIR / f"{stem}.json"
+def get_cached(stem, queue_key):
+    cache_img_key  = f"cache/{stem}.png"
+    cache_meta_key = f"cache/{stem}.json"
 
-    if cache_img.exists() and cache_meta.exists():
-        meta = json.loads(cache_meta.read_text())
-        return {"boxes": meta["boxes"], "img_path": cache_img}
+    if r2_exists(cache_img_key) and r2_exists(cache_meta_key):
+        meta = json.loads(r2_read_text(cache_meta_key))
+        return {"boxes": meta["boxes"]}
 
-    img = cv2.imread(str(src_path))
+    raw = r2_read_bytes(queue_key)
+    if raw is None:
+        raise ValueError(f"Cannot read {queue_key} from R2")
+
+    img = bytes_to_np(raw)
     if img is None:
-        raise ValueError(f"Cannot read image: {src_path.name}")
+        raise ValueError(f"Could not decode image: {queue_key}")
 
-    h, w = img.shape[:2]
-
-    # OCR on the clean original for best accuracy
+    h, w  = img.shape[:2]
     boxes    = extract_boxes(img, w, h)
-
-    # Apply all degradations
     degraded = degrade(img.copy())
 
-    cv2.imwrite(str(cache_img), degraded)
-    cache_meta.write_text(json.dumps({"boxes": boxes}))
+    r2_write_bytes(cache_img_key, np_to_png_bytes(degraded), "image/png")
+    r2_write_text(cache_meta_key, json.dumps({"boxes": boxes}))
 
-    return {"boxes": boxes, "img_path": cache_img}
+    return {"boxes": boxes}
 
 
 # ══════════════════════════════════════════════════════════════════
-# FLASK ROUTES
+# ROUTES
 # ══════════════════════════════════════════════════════════════════
 
 @app.route("/")
 def index():
     return render_template("index.html")
-
 
 @app.route("/api/status")
 def api_status():
@@ -266,21 +317,17 @@ def api_status():
         "split_counts": state["split_counts"],
     })
 
-
 @app.route("/api/next")
 def api_next():
     items = queue_items()
     if not items:
         return jsonify({"done": True})
-
     item = items[0]
     stem = item["stem"]
-
     try:
-        cached = get_cached(stem, item["path"])
+        cached = get_cached(stem, item["key"])
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
     return jsonify({
         "done":      False,
         "stem":      stem,
@@ -289,11 +336,12 @@ def api_next():
         "remaining": len(items),
     })
 
-
-@app.route("/cache_img/<filename>")
-def cache_img_route(filename):
-    return send_from_directory(CACHE_DIR, filename)
-
+@app.route("/cache_img/<stem>.png")
+def cache_img_route(stem):
+    data = r2_read_bytes(f"cache/{stem}.png")
+    if data is None:
+        abort(404)
+    return send_file(io.BytesIO(data), mimetype="image/png")
 
 @app.route("/api/submit", methods=["POST"])
 def api_submit():
@@ -304,7 +352,6 @@ def api_submit():
     state = load_state()
     split = next_split(state["split_counts"])
 
-    # Build YOLO label lines  (0=readable, 1=unreadable)
     label_lines = []
     for b in boxes:
         cls = 1 if b["label"] == "unreadable" else 0
@@ -312,60 +359,35 @@ def api_submit():
             f"{cls} {b['xc']:.6f} {b['yc']:.6f} {b['w']:.6f} {b['h']:.6f}"
         )
 
-    # Locate original in queue
-    src = None
+    img_data = r2_read_bytes(f"cache/{stem}.png")
+    if img_data is None:
+        abort(404, "Cached image not found")
+
+    r2_write_bytes(f"dataset/images/{split}/{stem}.png", img_data, "image/png")
+    r2_write_text(f"dataset/labels/{split}/{stem}.txt",  "\n".join(label_lines))
+
+    # Mark original as done
     for ext in IMG_EXTS:
-        p = QUEUE_DIR / f"{stem}{ext}"
-        if p.exists():
-            src = p
+        k = f"queue/{stem}{ext}"
+        if r2_exists(k):
+            raw = r2_read_bytes(k)
+            r2_write_bytes(f"queue/{stem}_done{ext}", raw)
+            r2_delete(k)
             break
-    if src is None:
-        abort(404, f"Original not found for stem: {stem}")
 
-    img_dst   = DATASET_DIR / "images" / split / f"{stem}.png"
-    label_dst = DATASET_DIR / "labels" / split / f"{stem}.txt"
-
-    # Copy degraded PNG from cache into dataset
-    cache_img_path = CACHE_DIR / f"{stem}.png"
-    shutil.copy2(cache_img_path, img_dst)
-    label_dst.write_text("\n".join(label_lines))
-
-    # Mark original as done so it won't reappear
-    src.rename(QUEUE_DIR / f"{stem}_done{src.suffix}")
-
-    # Clean up cache entry
-    for f in [CACHE_DIR / f"{stem}.png", CACHE_DIR / f"{stem}.json"]:
-        if f.exists():
-            f.unlink()
+    r2_delete(f"cache/{stem}.png")
+    r2_delete(f"cache/{stem}.json")
 
     state["done"] += 1
     state["split_counts"][split] += 1
     save_state(state)
 
-    # Keep data.yaml up to date
-    yaml_content = (
-        f"path: {DATASET_DIR.resolve()}\n"
-        f"train: images/train\n"
-        f"val:   images/val\n"
-        f"test:  images/test\n\n"
-        f"nc: 2\n"
-        f"names:\n"
-        f"  0: readable\n"
-        f"  1: unreadable\n"
+    r2_write_text("dataset/data.yaml",
+        "path: dataset\ntrain: images/train\nval:   images/val\n"
+        "test:  images/test\n\nnc: 2\nnames:\n  0: readable\n  1: unreadable\n"
     )
-    (DATASET_DIR / "data.yaml").write_text(yaml_content)
 
     return jsonify({"ok": True, "split": split, "done": state["done"]})
 
-
-# ══════════════════════════════════════════════════════════════════
-# ENTRY POINT
-# ══════════════════════════════════════════════════════════════════
-
 if __name__ == "__main__":
-    for d in [QUEUE_DIR, CACHE_DIR]:
-        d.mkdir(exist_ok=True)
-    print(f"\n  Labeller running ->  http://localhost:5000")
-    print(f"  Drop ORIGINAL images (.jpg / .png) into:  {QUEUE_DIR}")
-    print(f"  OCR + degradation runs automatically per image.\n")
-    app.run(debug=True, port=5000)
+    app.run(debug=False, port=5000)
