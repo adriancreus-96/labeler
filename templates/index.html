@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>YOLO Degradation Labeller</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Syne:wght@700;800&display=swap" rel="stylesheet"/>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d0f14;--surface:#13161e;--border:#232737;
+  --accent:#e8ff47;--danger:#ff4757;--safe:#2ed573;
+  --muted:#4a5068;--text:#d8dde8;
+  --mono:'IBM Plex Mono',monospace;--display:'Syne',sans-serif;
+}
+html,body{height:100%;background:var(--bg);color:var(--text);font-family:var(--mono)}
+#app{display:grid;grid-template-rows:auto 1fr auto;height:100vh;overflow:hidden}
+
+/* ── Header ── */
+header{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:14px 28px;background:var(--surface);border-bottom:1px solid var(--border);gap:24px;
+}
+header h1{font-family:var(--display);font-size:1.1rem;letter-spacing:.04em;color:var(--accent);white-space:nowrap}
+#progress-bar-wrap{flex:1;height:6px;background:var(--border);border-radius:3px;overflow:hidden}
+#progress-bar{height:100%;background:var(--accent);border-radius:3px;transition:width .5s ease}
+#progress-label{font-size:.72rem;color:var(--muted);white-space:nowrap}
+#split-pills{display:flex;gap:8px}
+.pill{font-size:.65rem;padding:3px 10px;border-radius:99px;border:1px solid var(--border);color:var(--muted);letter-spacing:.05em}
+.pill span{color:var(--accent);font-weight:600}
+
+/* ── Canvas area ── */
+#canvas-wrap{
+  position:relative;overflow:auto;display:flex;align-items:center;justify-content:center;
+  background:
+    radial-gradient(ellipse at 20% 20%,#1a1d2a 0%,transparent 60%),
+    radial-gradient(ellipse at 80% 80%,#131620 0%,transparent 55%),
+    var(--bg);
+}
+#canvas-wrap canvas{
+  display:block;cursor:crosshair;image-rendering:pixelated;
+  box-shadow:0 0 60px rgba(0,0,0,.7);border:1px solid var(--border);
+  max-width:100%;max-height:100%;
+}
+
+/* ── Overlay ── */
+#state-overlay{
+  position:absolute;inset:0;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:16px;
+  background:var(--bg);font-family:var(--display);
+}
+#state-overlay.hidden{display:none}
+.big{font-size:2.8rem;color:var(--accent)}
+.sub{font-size:.85rem;color:var(--muted);text-align:center;max-width:360px;line-height:1.7}
+
+/* spinner */
+.spinner{
+  width:40px;height:40px;
+  border:3px solid var(--border);border-top-color:var(--accent);
+  border-radius:50%;animation:spin .7s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* processing bar */
+.proc-wrap{width:280px;height:4px;background:var(--border);border-radius:2px;overflow:hidden}
+.proc-bar{height:100%;background:var(--accent);border-radius:2px;width:0%;transition:width .4s ease}
+
+/* ── Footer ── */
+footer{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:14px 28px;background:var(--surface);border-top:1px solid var(--border);gap:16px;
+}
+#legend{display:flex;gap:18px;font-size:.72rem;color:var(--muted);align-items:center}
+.dot{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px}
+.dot-r{background:var(--safe)}.dot-u{background:var(--danger)}
+#hint{font-size:.7rem;color:var(--muted);text-align:center;flex:1}
+
+#btn-next{
+  padding:11px 36px;background:var(--accent);color:#0d0f14;
+  font-family:var(--display);font-size:.95rem;font-weight:800;
+  border:none;border-radius:4px;cursor:pointer;letter-spacing:.05em;
+  transition:transform .1s,box-shadow .15s;
+}
+#btn-next:hover{transform:translateY(-1px);box-shadow:0 4px 22px rgba(232,255,71,.35)}
+#btn-next:active{transform:translateY(0)}
+#btn-next:disabled{opacity:.3;cursor:not-allowed;transform:none;box-shadow:none}
+
+/* ── Toast ── */
+#toast{
+  position:fixed;bottom:84px;left:50%;transform:translateX(-50%) translateY(16px);
+  background:var(--surface);border:1px solid var(--border);
+  padding:7px 20px;border-radius:6px;font-size:.78rem;
+  opacity:0;transition:opacity .25s,transform .25s;pointer-events:none;white-space:nowrap;
+}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- Header -->
+  <header>
+    <h1>⬛ YOLO LABELLER</h1>
+    <div id="progress-bar-wrap"><div id="progress-bar" style="width:0%"></div></div>
+    <div id="progress-label">0 / 0</div>
+    <div id="split-pills">
+      <div class="pill">train <span id="pill-train">0</span></div>
+      <div class="pill">val <span id="pill-val">0</span></div>
+      <div class="pill">test <span id="pill-test">0</span></div>
+    </div>
+  </header>
+
+  <!-- Canvas -->
+  <div id="canvas-wrap">
+    <canvas id="cv"></canvas>
+    <div id="state-overlay">
+      <div class="spinner" id="ov-spinner"></div>
+      <div class="sub" id="ov-msg">Starting up…</div>
+      <div class="proc-wrap"><div class="proc-bar" id="ov-bar"></div></div>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <footer>
+    <div id="legend">
+      <span><span class="dot dot-r"></span>readable</span>
+      <span><span class="dot dot-u"></span>unreadable</span>
+    </div>
+    <div id="hint">Click any box to toggle readable ↔ unreadable, then press NEXT</div>
+    <button id="btn-next" disabled>NEXT →</button>
+  </footer>
+
+</div>
+<div id="toast"></div>
+
+<script>
+// ── Elements ─────────────────────────────────────────────────────────────
+const cvEl    = document.getElementById('cv');
+const ctx     = cvEl.getContext('2d');
+const overlay = document.getElementById('state-overlay');
+const ovSpinner = document.getElementById('ov-spinner');
+const ovMsg   = document.getElementById('ov-msg');
+const ovBar   = document.getElementById('ov-bar');
+const btnNext = document.getElementById('btn-next');
+
+// ── State ─────────────────────────────────────────────────────────────────
+let currentStem = null;
+let boxes       = [];
+let imgEl       = null;
+let naturalW = 1, naturalH = 1, scale = 1;
+
+// ── Fake progress bar ─────────────────────────────────────────────────────
+let barTimer = null;
+function startBar() {
+  let pct = 0;
+  ovBar.style.width = '0%';
+  barTimer = setInterval(() => {
+    pct += (92 - pct) * 0.035;
+    ovBar.style.width = pct + '%';
+  }, 150);
+}
+function finishBar() {
+  clearInterval(barTimer);
+  ovBar.style.width = '100%';
+  setTimeout(() => { ovBar.style.width = '0%'; }, 350);
+}
+
+// ── Overlay helpers ───────────────────────────────────────────────────────
+function showLoading(msg) {
+  overlay.classList.remove('hidden');
+  ovSpinner.style.display = 'block';
+  ovMsg.innerHTML = msg.replace(/\n/g, '<br>');
+  ovBar.style.display = 'block';
+  ovBar.parentElement.style.display = 'block';
+}
+function showDone(msg) {
+  overlay.classList.remove('hidden');
+  ovSpinner.style.display = 'none';
+  ovBar.parentElement.style.display = 'none';
+  ovMsg.innerHTML = `<div class="big">✓</div>${msg}`;
+}
+function showError(msg) {
+  overlay.classList.remove('hidden');
+  ovSpinner.style.display = 'none';
+  ovBar.parentElement.style.display = 'none';
+  ovMsg.innerHTML = `<div class="big" style="color:var(--danger)">✕</div>${msg}`;
+}
+function hideOverlay() {
+  overlay.classList.add('hidden');
+}
+
+// ── Status bar ────────────────────────────────────────────────────────────
+async function updateStatus() {
+  const r = await fetch('/api/status').then(r => r.json());
+  const pct = r.total > 0 ? Math.round(r.done / r.total * 100) : 0;
+  document.getElementById('progress-bar').style.width = pct + '%';
+  document.getElementById('progress-label').textContent =
+    `${r.done.toLocaleString()} / ${r.total.toLocaleString()}`;
+  document.getElementById('pill-train').textContent = r.split_counts.train;
+  document.getElementById('pill-val').textContent   = r.split_counts.val;
+  document.getElementById('pill-test').textContent  = r.split_counts.test;
+}
+
+// ── Load next image ───────────────────────────────────────────────────────
+async function loadNext() {
+  btnNext.disabled = true;
+  showLoading('Running OCR + applying degradations…\nThis takes a few seconds per image.');
+  startBar();
+
+  let data;
+  try {
+    data = await fetch('/api/next').then(r => r.json());
+  } catch(e) {
+    finishBar();
+    showError('Network error. Is the server running?');
+    return;
+  }
+  finishBar();
+
+  if (data.error) { showError(`Server error:<br>${data.error}`); return; }
+  if (data.done)  { showDone('All images labelled! 🎉'); return; }
+
+  currentStem = data.stem;
+  // Always start with all boxes as readable; user will mark unreadable ones
+  boxes = (data.boxes || []).map(b => ({ ...b, label: 'readable' }));
+
+  imgEl = new Image();
+  imgEl.onload = () => {
+    naturalW = imgEl.naturalWidth;
+    naturalH = imgEl.naturalHeight;
+    fitCanvas();
+    hideOverlay();
+    btnNext.disabled = false;
+    toast(`${data.remaining} image${data.remaining !== 1 ? 's' : ''} remaining`);
+  };
+  imgEl.onerror = () => showError('Could not load degraded image.');
+  imgEl.src = data.img_url + '?t=' + Date.now();  // cache-bust
+}
+
+// ── Canvas fit & draw ─────────────────────────────────────────────────────
+function fitCanvas() {
+  const wrap = document.getElementById('canvas-wrap');
+  const maxW = wrap.clientWidth  - 32;
+  const maxH = wrap.clientHeight - 32;
+  scale = Math.min(maxW / naturalW, maxH / naturalH, 1);
+  cvEl.width  = Math.round(naturalW * scale);
+  cvEl.height = Math.round(naturalH * scale);
+  redraw();
+}
+window.addEventListener('resize', () => { if (imgEl) fitCanvas(); });
+
+function redraw() {
+  ctx.clearRect(0, 0, cvEl.width, cvEl.height);
+  if (imgEl) ctx.drawImage(imgEl, 0, 0, cvEl.width, cvEl.height);
+
+  if (boxes.length === 0) {
+    ctx.save();
+    ctx.fillStyle = 'rgba(232,255,71,0.7)';
+    ctx.font = '13px IBM Plex Mono, monospace';
+    ctx.fillText('No word boxes found (low OCR confidence) — click NEXT to continue', 12, 26);
+    ctx.restore();
+    return;
+  }
+
+  boxes.forEach(b => {
+    const px = (b.xc - b.w / 2) * naturalW * scale;
+    const py = (b.yc - b.h / 2) * naturalH * scale;
+    const pw = b.w * naturalW * scale;
+    const ph = b.h * naturalH * scale;
+    const isU   = b.label === 'unreadable';
+    const stroke = isU ? '#ff4757' : '#2ed573';
+    const fill   = isU ? 'rgba(255,71,87,.2)' : 'rgba(46,213,115,.1)';
+
+    ctx.save();
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth   = isU ? 2 : 1.5;
+    ctx.fillStyle   = fill;
+    ctx.fillRect(px, py, pw, ph);
+    ctx.strokeRect(px, py, pw, ph);
+    if (isU) {
+      const fs = Math.max(9, Math.min(ph * 0.5, 18));
+      ctx.fillStyle = stroke;
+      ctx.font = `bold ${fs}px IBM Plex Mono, monospace`;
+      ctx.textBaseline = 'middle';
+      const tw = ctx.measureText('✕').width;
+      ctx.fillText('✕', px + pw / 2 - tw / 2, py + ph / 2);
+    }
+    ctx.restore();
+  });
+}
+
+// ── Click to toggle box ───────────────────────────────────────────────────
+cvEl.addEventListener('click', e => {
+  const rect = cvEl.getBoundingClientRect();
+  const cx = e.clientX - rect.left;
+  const cy = e.clientY - rect.top;
+  let hit = -1;
+  boxes.forEach((b, i) => {
+    const px = (b.xc - b.w / 2) * naturalW * scale;
+    const py = (b.yc - b.h / 2) * naturalH * scale;
+    const pw = b.w * naturalW * scale;
+    const ph = b.h * naturalH * scale;
+    if (cx >= px && cx <= px + pw && cy >= py && cy <= py + ph) hit = i;
+  });
+  if (hit >= 0) {
+    boxes[hit].label = boxes[hit].label === 'readable' ? 'unreadable' : 'readable';
+    redraw();
+  }
+});
+
+// ── Submit / Next ─────────────────────────────────────────────────────────
+btnNext.addEventListener('click', async () => {
+  btnNext.disabled = true;
+  showLoading('Saving to dataset…');
+
+  let r;
+  try {
+    r = await fetch('/api/submit', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ stem: currentStem, boxes }),
+    }).then(r => r.json());
+  } catch(e) {
+    showError('Network error while saving.');
+    return;
+  }
+
+  if (r.ok) {
+    toast(`Saved → ${r.split}  (total done: ${r.done})`);
+    updateStatus();
+    loadNext();
+  } else {
+    showError('Save failed — check the terminal for details.');
+  }
+});
+
+// ── Toast ─────────────────────────────────────────────────────────────────
+let toastTimer;
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2800);
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────
+updateStatus();
+loadNext();
+</script>
+</body>
+</html>
